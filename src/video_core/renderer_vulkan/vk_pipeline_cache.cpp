@@ -406,6 +406,40 @@ size_t GetTotalPipelineWorkers() {
 #endif
 }
 
+
+/// Reads a non-negative integer from an environment variable; `fallback` when unset or invalid.
+size_t EnvCount(const char* name, size_t fallback) {
+    const char* const value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    char* end{};
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return *end == '\0' ? static_cast<size_t>(parsed) : fallback;
+}
+
+/// EDEN_NX2_PREBUILD_PIPELINES: how many cached pipelines outside the boot set are built in the
+/// background after boot (default 64). Each built one holds ~0.45 MB of driver memory.
+size_t PrebuildCapacity() {
+    static const size_t capacity = std::min<size_t>(EnvCount("EDEN_NX2_PREBUILD_PIPELINES", 64),
+                                                    size_t{16384});
+    return capacity;
+}
+
+/// The captured guest environments of queued prebuilds stay in memory until built: 256 KiB each
+/// (16 MiB for the default 64).
+size_t PrebuildCaptureLimit() {
+    return PrebuildCapacity() * 256 * 1024;
+}
+
+/// EDEN_NX2_BOOT_SESSIONS=N: only pipelines used in the last N sessions are built before the game
+/// starts; older ones in the used list go to the background prebuild. 0 (default) = the whole
+/// list. Only admission changes: the saved list keeps its full history.
+size_t BootSessions() {
+    static const size_t sessions = std::min<size_t>(EnvCount("EDEN_NX2_BOOT_SESSIONS", 0),
+                                                    size_t{255});
+    return sessions;
+}
 } // Anonymous namespace
 
 size_t ComputePipelineCacheKey::Hash() const noexcept {
@@ -466,7 +500,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       emission_budget{num_pipeline_workers},
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
-      background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
+      background_pipelines{PrebuildCapacity(), PrebuildCaptureLimit(),
+                           device.HasBrokenParallelShaderCompiling()} {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1037,6 +1072,16 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
         ++state.total;
     }};
+    const size_t boot_sessions = BootSessions();
+    if (boot_sessions != 0 || PrebuildCapacity() != 64) {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline boot set: last {} sessions (0 = whole list), background prebuild up to {}",
+                 boot_sessions, PrebuildCapacity());
+    }
+    const auto used_at_boot{[&](u64 hash) {
+        const auto it = used_pipelines.find(hash);
+        return it != used_pipelines.end() && (boot_sessions == 0 || it->second < boot_sessions);
+    }};
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
@@ -1083,7 +1128,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         if (!PreloadAllPipelines() &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
-                                    : !used_pipelines.contains(hash))) {
+                                    : !used_at_boot(hash))) {
             ++skipped_pipelines;
             size_t capture_bytes = (envs.capacity() - envs.size()) * sizeof(FileEnvironment);
             for (const auto& env : envs) {
